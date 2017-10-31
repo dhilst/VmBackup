@@ -33,6 +33,7 @@
 # Title: NAUbackup / VmBackup - a XenServer vm-export and vdi-export Backup Script
 # Package Contents: README.md, VmBackup.py (this file), example.cfg
 # Version History
+# - v3.22 2017/10/30 Add stop_vms and lockfile options.
 # - v3.21 2017/09/29 Fix "except socket.error" syntax to also work with older
 #         python version in XenServer 6.X
 # - v3.2 2017/09/12 Fix wildcard handling and excludes for both VM and VDI
@@ -58,6 +59,7 @@
 # Usage w/ config file for multiple vm backups, where you can specify either vm-export or vdi-export:
 #    ./VmBackup.py <password> <config-file-path>
 
+from time import sleep
 import sys, time, os, datetime, subprocess, re, shutil, XenAPI, smtplib, re, base64, socket
 from email.MIMEText import MIMEText
 from subprocess import PIPE
@@ -74,6 +76,7 @@ DEFAULT_BACKUP_DIR = '/snapshots/BACKUPS'
 # note - some NAS file servers may fail with ':', so change to your desired format
 BACKUP_DIR_PATTERN = '%s/backup-%04d-%02d-%02d-(%02d:%02d:%02d)'
 DEFAULT_STATUS_LOG = '/snapshots/NAUbackup/status.log'
+DEFAULT_LOCK_FILE = '/tmp/VmBackup.lock'
 
 ############################# OPTIONAL
 # optional email may be triggered by configure next 3 parameters then find MAIL_ENABLE and uncommenting out the desired lines
@@ -84,9 +87,21 @@ MAIL_SMTP_SERVER = 'your-mail-server'
 
 config = {}
 all_vms = []
-expected_keys = ['pool_db_backup', 'max_backups', 'backup_dir', 'status_log', 'vdi_export_format', 'vm-export', 'vdi-export', 'exclude']
+expected_keys = ['pool_db_backup', 'max_backups', 'backup_dir', 'status_log', 'vdi_export_format', 'vm-export', 'vdi-export', 'exclude', 'stop_vms', 'lockfile']
 message = ''
 xe_path = '/opt/xensource/bin' 
+
+import fcntl
+class FileLock(object):
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.fil = open(self.path, 'w')
+        fcntl.lockf(self.fil, fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+    def __exit__(self, type_, value, traceback):
+        fcntl.lockf(self.fil, fcntl.LOCK_UN)
 
 def main(session): 
 
@@ -352,11 +367,23 @@ def main(session):
         # --- begin vm-export command sequence ---
         log ('*** vm-export begin xe command sequence')
         # is vm currently running?
-        cmd = '%s/xe vm-list name-label="%s" params=power-state | /bin/grep running' % (xe_path, vm_name)
-        if run_log_out_wait_rc(cmd) == 0:
-            log ('vm is running')
-        else:
-            log ('vm is NOT running')
+        if config['stop_vms']:
+            cmd = '%s/xe vm-list name-label="%s" params=power-state | /bin/grep running' % (xe_path, vm_name)
+            is_running = run_log_out_wait_rc(cmd) == 0
+            if is_running:
+                log ('vm is running')
+                log ('stopping it')
+                if run_log_out_wait_rc('%s/xe vm-shutdown uuid=%s' % (xe_path, vm_uuid)) != 0:
+                    log ('ERROR: Cant stopping %s, trying next VM.' % vm_name)
+                    continue
+                log ('waiting %s to stop' % vm_name)
+                cmd = '%s/xe vm-param-get param-name=power-state uuid=%s' % (xe_path, vm_uuid)
+                while run_get_lastline(cmd) != 'halted':
+                    sleep(3)
+                    log ('still waiting %s to stop' % vm_name)
+            else:
+                log ('vm is NOT running')
+
 
         # check for old vm-snapshot for this vm
         snap_name = 'RESTORE_%s' % vm_name
@@ -456,6 +483,13 @@ def main(session):
             log('VmBackup vm-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, str(elapseTime.seconds/60)))
             if config_specified:
                 status_log_vm_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+
+    	if config['stop_vms'] and is_running:
+            log('vm %s was running, starting it again' % vm_name)
+            cmd = '%s/xe vm-start uuid=%s' % (xe_path, vm_uuid)
+            if run_log_out_wait_rc(cmd) != 0:
+                log('ERROR: COULD NOT START VM %s' % vm_name)
+
 
     # end of for vm_parm in config['vm-export']:
     ######################################################################
@@ -939,10 +973,12 @@ def config_load(path):
                 save_to_config_exclude( key, value)
             elif key in ['vm-export','vdi-export']:
                 save_to_config_export( key, value)
+            elif key == 'stop_vms':
+                config['stop_vms'] = value.lower() == 'true'
             else:
                 # all other key's
                 save_to_config_values( key, value)
-
+            
     return return_value
 
 def save_to_config_exclude( key, vm_name):
@@ -1143,6 +1179,11 @@ def config_load_defaults():
         config['backup_dir'] = str(DEFAULT_BACKUP_DIR)
     if not 'status_log' in config.keys():
         config['status_log'] = str(DEFAULT_STATUS_LOG)
+    if not 'lockfile' in config.keys():
+        config['lockfile'] = str(DEFAULT_LOCK_FILE)
+    if not 'stop_vms' in config.keys():
+        config['stop_vms'] = False
+
 
 def config_print():
     log('VmBackup.py running with these settings:')
@@ -1463,7 +1504,11 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        main(session)
+        lockfil = config['lockfile']
+        log('LOCKING %s' % lockfil)
+        with FileLock(lockfil):
+            main(session)
+        log('UNLOCKING %s' % lockfil)
 
     except Exception, e:
         print e
