@@ -65,6 +65,7 @@ from email.MIMEText import MIMEText
 from subprocess import PIPE
 from subprocess import STDOUT
 from os.path import join
+import codecs
 
 ############################# HARD CODED DEFAULTS
 # modify these hard coded default values, only used if not specified in config file
@@ -593,7 +594,7 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
 
     # Backup vm meta data
     log ('Writing vm config file.')
-    vm_out = open ('%s/vm.cfg' % tmp_full_backup_dir, 'w')
+    vm_out = codecs.open ('%s/vm.cfg' % tmp_full_backup_dir, 'w', encoding='utf-8')
     vm_out.write('name_label=%s\n' % vm_record['name_label'])
     vm_out.write('name_description=%s\n' % vm_record['name_description'])
     vm_out.write('memory_dynamic_max=%s\n' % vm_record['memory_dynamic_max'])
