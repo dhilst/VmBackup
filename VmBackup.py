@@ -484,7 +484,7 @@ def main(session):
             if config_specified:
                 status_log_vm_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
 
-    	if config['stop_vms'] and is_running:
+        if config['stop_vms'] and is_running:
             log('vm %s was running, starting it again' % vm_name)
             cmd = '%s/xe vm-start uuid=%s' % (xe_path, vm_uuid)
             if run_log_out_wait_rc(cmd) != 0:
