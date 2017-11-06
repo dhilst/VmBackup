@@ -59,6 +59,8 @@
 # Usage w/ config file for multiple vm backups, where you can specify either vm-export or vdi-export:
 #    ./VmBackup.py <password> <config-file-path>
 
+from contextlib import contextmanager
+import fcntl
 from time import sleep
 import sys, time, os, datetime, subprocess, re, shutil, XenAPI, smtplib, re, base64, socket
 from email.MIMEText import MIMEText
@@ -92,17 +94,47 @@ expected_keys = ['pool_db_backup', 'max_backups', 'backup_dir', 'status_log', 'v
 message = ''
 xe_path = '/opt/xensource/bin' 
 
-import fcntl
-class FileLock(object):
-    def __init__(self, path):
-        self.path = path
+@contextmanager
+def filelock(path):
+    fil = open(path, 'w')
+    fcntl.lockf(fil, fcntl.LOCK_EX|fcntl.LOCK_NB)
+    yield
+    fcntl.lockf(fil, fcntl.LOCK_UN)
 
-    def __enter__(self):
-        self.fil = open(self.path, 'w')
-        fcntl.lockf(self.fil, fcntl.LOCK_EX|fcntl.LOCK_NB)
-
-    def __exit__(self, type_, value, traceback):
-        fcntl.lockf(self.fil, fcntl.LOCK_UN)
+@contextmanager
+def stop_vm(vm_name, vm_uuid):
+    '''Yields True in case of error.'''
+    # is vm currently running?
+    error = False
+    if config['stop_vms']:
+        cmd = '%s/xe vm-list name-label="%s" params=power-state | /bin/grep running' % (xe_path, vm_name)
+        is_running = run_log_out_wait_rc(cmd) == 0
+        if is_running:
+            log ('vm is running')
+            log ('stopping it')
+            if run_log_out_wait_rc('%s/xe vm-shutdown uuid=%s' % (xe_path, vm_uuid)) != 0:
+                log ('ERROR: Cant stopping %s, trying next VM.' % vm_name)
+            log ('waiting %s to stop' % vm_name)
+            cmd = '%s/xe vm-param-get param-name=power-state uuid=%s' % (xe_path, vm_uuid)
+            t = tries = 100
+            interval = 3
+            while run_get_lastline(cmd) != 'halted':
+                sleep(interval)
+                if t == 0:
+                    log ("ERROR: VM %s didn't stop after %d seconds" % (vm_name, tries * internal))
+                    error_cnt += 1 
+                    error = True
+                    break
+                log ('still waiting %s to stop' % vm_name)
+                t -= 1
+        else:
+            log ('vm is NOT running')
+    yield error
+    if not error and config['stop_vms'] and is_running:
+        log('vm %s was running, starting it again' % vm_name)
+        cmd = '%s/xe vm-start uuid=%s' % (xe_path, vm_uuid)
+        if run_log_out_wait_rc(cmd) != 0:
+            log('ERROR: COULD NOT START VM %s' % vm_name)
 
 def main(session): 
 
@@ -367,130 +399,108 @@ def main(session):
         # ----------------------------------------
         # --- begin vm-export command sequence ---
         log ('*** vm-export begin xe command sequence')
-        # is vm currently running?
-        if config['stop_vms']:
-            cmd = '%s/xe vm-list name-label="%s" params=power-state | /bin/grep running' % (xe_path, vm_name)
-            is_running = run_log_out_wait_rc(cmd) == 0
-            if is_running:
-                log ('vm is running')
-                log ('stopping it')
-                if run_log_out_wait_rc('%s/xe vm-shutdown uuid=%s' % (xe_path, vm_uuid)) != 0:
-                    log ('ERROR: Cant stopping %s, trying next VM.' % vm_name)
-                    continue
-                log ('waiting %s to stop' % vm_name)
-                cmd = '%s/xe vm-param-get param-name=power-state uuid=%s' % (xe_path, vm_uuid)
-                while run_get_lastline(cmd) != 'halted':
-                    sleep(3)
-                    log ('still waiting %s to stop' % vm_name)
-            else:
-                log ('vm is NOT running')
+        with stop_vm(vm_name, vm_uuid) as error:
+            if error:
+                continue
 
+            # check for old vm-snapshot for this vm
+            snap_name = 'RESTORE_%s' % vm_name
+            log ('check for prev-vm-snapshot: %s' % snap_name)
+            cmd = "%s/xe vm-list name-label='%s' params=uuid | /bin/awk -F': ' '{print $2}' | /bin/grep '-'" % (xe_path, snap_name)
+            old_snap_vm_uuid = run_get_lastline(cmd)
+            if old_snap_vm_uuid != '':
+                log ('cleanup old-snap-vm-uuid: %s' % old_snap_vm_uuid)
+                # vm-uninstall old vm-snapshot
+                cmd = '%s/xe vm-uninstall uuid=%s force=true' % (xe_path, old_snap_vm_uuid)
+                log('cmd: %s' % cmd)
+                if run_log_out_wait_rc(cmd) != 0:
+                    log('WARNING-ERROR %s' % cmd)
+                    this_status = 'warning'
+                    if config_specified:
+                        status_log_vm_export_end(server_name, 'VM-UNINSTALL-FAIL-1 %s' % vm_name)
+                    # non-fatal - finsh processing for this vm
 
-        # check for old vm-snapshot for this vm
-        snap_name = 'RESTORE_%s' % vm_name
-        log ('check for prev-vm-snapshot: %s' % snap_name)
-        cmd = "%s/xe vm-list name-label='%s' params=uuid | /bin/awk -F': ' '{print $2}' | /bin/grep '-'" % (xe_path, snap_name)
-        old_snap_vm_uuid = run_get_lastline(cmd)
-        if old_snap_vm_uuid != '':
-            log ('cleanup old-snap-vm-uuid: %s' % old_snap_vm_uuid)
-            # vm-uninstall old vm-snapshot
-            cmd = '%s/xe vm-uninstall uuid=%s force=true' % (xe_path, old_snap_vm_uuid)
-            log('cmd: %s' % cmd)
-            if run_log_out_wait_rc(cmd) != 0:
-                log('WARNING-ERROR %s' % cmd)
-                this_status = 'warning'
+            # take a vm-snapshot of this vm
+            cmd = '%s/xe vm-snapshot vm=%s new-name-label="%s"' % (xe_path, vm_uuid, snap_name)
+            log('1.cmd: %s' % cmd)
+            snap_vm_uuid = run_get_lastline(cmd)
+            log ('snap-uuid: %s' % snap_vm_uuid)
+            if snap_vm_uuid == '':
+                log('ERROR %s' % cmd)
                 if config_specified:
-                    status_log_vm_export_end(server_name, 'VM-UNINSTALL-FAIL-1 %s' % vm_name)
+                    status_log_vm_export_end(server_name, 'SNAPSHOT-FAIL %s' % vm_name)
+                error_cnt += 1
+                # next vm
+                continue
+
+            # change vm-snapshot so that it can be referenced by vm-export
+            cmd = '%s/xe template-param-set is-a-template=false ha-always-run=false uuid=%s' % (xe_path, snap_vm_uuid)
+            log('2.cmd: %s' % cmd)
+            if run_log_out_wait_rc(cmd) != 0:
+                log('ERROR %s' % cmd)
+                if config_specified:
+                    status_log_vm_export_end(server_name, 'TEMPLATE-PARAM-SET-FAIL %s' % vm_name)
+                error_cnt += 1
+                # next vm
+                continue
+        
+            # vm-export vm-snapshot
+            cmd = '%s/xe vm-export uuid=%s' % (xe_path, snap_vm_uuid)
+            if compress:
+                full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva.gz')
+                cmd = '%s filename="%s" compress=true' % (cmd, full_path_backup_file)
+            else:
+                full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva')
+                cmd = '%s filename="%s"' % (cmd, full_path_backup_file) 
+            log('3.cmd: %s' % cmd)
+            if run_log_out_wait_rc(cmd) == 0:
+                log('vm-export success')
+            else:
+                log('ERROR %s' % cmd)
+                if config_specified:
+                    status_log_vm_export_end(server_name, 'VM-EXPORT-FAIL %s' % vm_name)
+                error_cnt += 1
+                # next vm
+                continue
+        
+            # vm-uninstall vm-snapshot
+            cmd = '%s/xe vm-uninstall uuid=%s force=true' % (xe_path, snap_vm_uuid)
+            log('4.cmd: %s' % cmd)
+            if run_log_out_wait_rc(cmd) != 0:
+                log('WARNING %s' % cmd)
+                this_status = 'warning'
                 # non-fatal - finsh processing for this vm
 
-        # take a vm-snapshot of this vm
-        cmd = '%s/xe vm-snapshot vm=%s new-name-label="%s"' % (xe_path, vm_uuid, snap_name)
-        log('1.cmd: %s' % cmd)
-        snap_vm_uuid = run_get_lastline(cmd)
-        log ('snap-uuid: %s' % snap_vm_uuid)
-        if snap_vm_uuid == '':
-            log('ERROR %s' % cmd)
-            if config_specified:
-                status_log_vm_export_end(server_name, 'SNAPSHOT-FAIL %s' % vm_name)
-            error_cnt += 1
-            # next vm
-            continue
+            log ('*** vm-export end')
+            # --- end vm-export command sequence ---
+            # ----------------------------------------
 
-        # change vm-snapshot so that it can be referenced by vm-export
-        cmd = '%s/xe template-param-set is-a-template=false ha-always-run=false uuid=%s' % (xe_path, snap_vm_uuid)
-        log('2.cmd: %s' % cmd)
-        if run_log_out_wait_rc(cmd) != 0:
-            log('ERROR %s' % cmd)
-            if config_specified:
-                status_log_vm_export_end(server_name, 'TEMPLATE-PARAM-SET-FAIL %s' % vm_name)
-            error_cnt += 1
-            # next vm
-            continue
-    
-        # vm-export vm-snapshot
-        cmd = '%s/xe vm-export uuid=%s' % (xe_path, snap_vm_uuid)
-        if compress:
-            full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva.gz')
-            cmd = '%s filename="%s" compress=true' % (cmd, full_path_backup_file)
-        else:
-            full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva')
-            cmd = '%s filename="%s"' % (cmd, full_path_backup_file) 
-        log('3.cmd: %s' % cmd)
-        if run_log_out_wait_rc(cmd) == 0:
-            log('vm-export success')
-        else:
-            log('ERROR %s' % cmd)
-            if config_specified:
-                status_log_vm_export_end(server_name, 'VM-EXPORT-FAIL %s' % vm_name)
-            error_cnt += 1
-            # next vm
-            continue
-    
-        # vm-uninstall vm-snapshot
-        cmd = '%s/xe vm-uninstall uuid=%s force=true' % (xe_path, snap_vm_uuid)
-        log('4.cmd: %s' % cmd)
-        if run_log_out_wait_rc(cmd) != 0:
-            log('WARNING %s' % cmd)
-            this_status = 'warning'
-            # non-fatal - finsh processing for this vm
+            elapseTime = datetime.datetime.now() - beginTime
+            backup_file_size = os.path.getsize(full_path_backup_file) / (1024 * 1024 * 1024)
+            final_cleanup( full_path_backup_file, backup_file_size, full_backup_dir, vm_backup_dir, vm_max_backups)
 
-        log ('*** vm-export end')
-        # --- end vm-export command sequence ---
-        # ----------------------------------------
+            if not check_all_backups_success(vm_backup_dir):
+                log('WARNING cleanup needed - not all backup history is successful')
+                this_status = 'warning'
 
-        elapseTime = datetime.datetime.now() - beginTime
-        backup_file_size = os.path.getsize(full_path_backup_file) / (1024 * 1024 * 1024)
-        final_cleanup( full_path_backup_file, backup_file_size, full_backup_dir, vm_backup_dir, vm_max_backups)
+            if (this_status == 'success'):
+                success_cnt += 1
+                log('VmBackup vm-export %s - ***Success*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
+                if config_specified:
+                    status_log_vm_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
 
-        if not check_all_backups_success(vm_backup_dir):
-            log('WARNING cleanup needed - not all backup history is successful')
-            this_status = 'warning'
+            elif (this_status == 'warning'):
+                warning_cnt += 1 
+                log('VmBackup vm-export %s - ***WARNING*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
+                if config_specified:
+                    status_log_vm_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
 
-        if (this_status == 'success'):
-            success_cnt += 1
-            log('VmBackup vm-export %s - ***Success*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
-            if config_specified:
-                status_log_vm_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
-
-        elif (this_status == 'warning'):
-            warning_cnt += 1 
-            log('VmBackup vm-export %s - ***WARNING*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
-            if config_specified:
-                status_log_vm_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
-
-        else:
-            # this should never occur since all errors do a continue on to the next vm_name
-            error_cnt += 1
-            log('VmBackup vm-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, str(elapseTime.seconds/60)))
-            if config_specified:
-                status_log_vm_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
-
-        if config['stop_vms'] and is_running:
-            log('vm %s was running, starting it again' % vm_name)
-            cmd = '%s/xe vm-start uuid=%s' % (xe_path, vm_uuid)
-            if run_log_out_wait_rc(cmd) != 0:
-                log('ERROR: COULD NOT START VM %s' % vm_name)
-
+            else:
+                # this should never occur since all errors do a continue on to the next vm_name
+                error_cnt += 1
+                log('VmBackup vm-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, str(elapseTime.seconds/60)))
+                if config_specified:
+                    status_log_vm_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
 
     # end of for vm_parm in config['vm-export']:
     ######################################################################
@@ -1507,7 +1517,7 @@ if __name__ == '__main__':
     try:
         lockfil = config['lockfile']
         log('LOCKING %s' % lockfil)
-        with FileLock(lockfil):
+        with filelock(lockfil):
             main(session)
         log('UNLOCKING %s' % lockfil)
 
